@@ -120,7 +120,57 @@ def generate_previous_pattern_steady_state():
     return prior_over_patterns / np.sum(prior_over_patterns)
 
 def generate_random_pattern_rollouts(base_price, rollout_probability):
-    return []#Rollout(rollout_probability, "Random", None)]
+    # Random is in 5 phases: inc, dec, inc, dec, inc
+    # Lengths add up to 12
+    # Dec_1 is [2,3] long
+    # Dec_2 is 5 - Dec_1 long
+    # Inc_1 is [0-6] long
+    # Inc_2and3 is 7 - Inc_1 long
+    # Inc_3 is [0, Inc_2and3] long
+    # Inc_2 is Inc_2and3 - Inc_3 long
+    out = []
+    reduced_prob = 1.
+    for inc_1_length in range(7):
+        reduced_prob /= 7.
+        inc_2and3_length = 7 - inc_1_length
+        for inc_3_length in range(0, inc_2and3_length):
+            reduced_prob /= inc_2and3_length
+            inc_2_length = inc_2and3_length - inc_3_length
+            for dec_1_length in [2, 3]:
+                reduced_prob /= 2
+                dec_2_length = 5 - dec_1_length
+
+                # Actual generation of this rollout
+                prices = []
+                
+                # INC 1
+                for k in range(inc_1_length):
+                    prices.append(random_uniform("inc_1_rate_%d" % k, 0.9, 1.4) * base_price)
+                
+                # DEC 1
+                rate = random_uniform("dec_1_initial_rate", 0.6, 0.8)
+                for k in range(dec_1_length):
+                    prices.append(rate * base_price)
+                    rate -= 0.04
+                    rate -= random_uniform("dec_1_dec_%d" % k, 0.0, 0.06)
+
+                # INC 2
+                for k in range(inc_2_length):
+                    prices.append(random_uniform("inc_2_rate_%d" % k, 0.9, 1.4) * base_price)
+                
+                # DEC 2
+                rate = random_uniform("dec_2_initial_rate", 0.6, 0.8)
+                for k in range(dec_2_length):
+                    prices.append(rate * base_price)
+                    rate -= 0.04
+                    rate -= random_uniform("dec_2_dec_%d" % k, 0.0, 0.06)
+
+                # INC 3
+                for k in range(inc_3_length):
+                    prices.append(random_uniform("inc_3_rate_%d" % k, 0.9, 1.4) * base_price)
+
+                out.append(Rollout(reduced_prob, "Random", prices))
+    return out
 
 def generate_large_spike_pattern_rollouts(base_price, rollout_probability):
     out = []
@@ -209,7 +259,7 @@ def generate_all_turnip_patterns(previous_pattern_prior, base_price=None):
 
     return all_rollouts
 
-def plot_gmm_results(valid_rollouts, observed):
+def plot_gmm_results(valid_rollouts, observed, subplots=False):
     # Combine the valid rollouts into a final model over prices
     # by combining the modes
     all_means = []
@@ -232,12 +282,16 @@ def plot_gmm_results(valid_rollouts, observed):
     plt.figure()
     plt.grid(True)
 
-    grid_cells = np.arange(0., 660., 1.)
+    if subplots:
+        for k in range(4):
+            plt.subplot(5, 1, k+1)
+            plt.title(pattern_index_to_name[k])
+            plt.grid(True)
 
-    total_prob_image = np.zeros((12, grid_cells.shape[0]))
     for k, rollout in enumerate(valid_rollouts):
-        total_prob_image += rollout.evaluate_componentwise_pdf(grid_cells)
-        
+        if subplots:
+            plt.subplot(5, 1, pattern_index_to_name.index(rollout.pattern_name) + 1)
+
         for comp_k in range(len(rollout.g.weights_)):
             mean = rollout.g.means_[comp_k, :]
             covar = rollout.g.covariances_[comp_k, :]
@@ -248,21 +302,16 @@ def plot_gmm_results(valid_rollouts, observed):
                 range(12), mean-1.96*np.sqrt(covar), mean+1.96*np.sqrt(covar),
                 alpha=0.5, edgecolor=colors_by_type[rollout.pattern_name],
                 facecolor=colormaps_by_type[rollout.pattern_name](float(k)/len(valid_rollouts)))
-        print(rollout.prices)
-        #plt.plot(range(12), rollout.v.T,
-        #         color=colors_by_type[rollout.pattern_name],
-        #         alpha=0.01, linestyle="--")
-    #interpolate.interp2d(total_prob_image
-    #plt.imshow(total_prob_image.T, origin='lower', extent=[0, 11, 0, 660], aspect='auto', cmap="summer", interpolation="bilinear")
 
     for comp_k in range(len(all_weights)):
         mean = all_means[comp_k, :]
         covar = all_covars[comp_k, :]
         weight = all_weights[comp_k]
-        #plt.plot(range(12), mean, 'k', color=colors_by_type["Average Prediction"])
-        #plt.fill_between(range(12), mean-1.96*np.sqrt(covar), mean+1.96*np.sqrt(covar),
-        #    alpha=0.2, edgecolor=colors_by_type["Average Prediction"], facecolor=[0.8, 0.1, 0.8], hatch="+")
-    # mean of means
+
+
+    # Mean of means
+    if subplots:
+        plt.subplot(5, 1, 5)
     plt.plot(range(12), np.sum(all_weights.T*all_means.T, axis=1), color=colors_by_type["Average Prediction"], alpha=0.5)
 
     ks = []
@@ -270,22 +319,37 @@ def plot_gmm_results(valid_rollouts, observed):
     for k, val in enumerate(observed):
         if val != 0:
             ks.append(k)
-            vals.append(val)
-    plt.scatter(ks, vals, color="k")
+            vals.append(val)  
 
-    label_lines = [Line2D([0], [0], color=colors_by_type[pattern_name], lw=4) for pattern_name in list(colors_by_type.keys())]
-    plt.legend(label_lines, list(colors_by_type.keys()))
+    for k in range(4):
+        if subplots:
+            plt.subplot(5, 1, k+1)
+        plt.scatter(ks, vals, color="k")
+        if not subplots:
+            break
+    if not subplots:
+        label_lines = [Line2D([0], [0], color=colors_by_type[pattern_name], lw=4) for pattern_name in list(colors_by_type.keys())]
+        plt.legend(label_lines, list(colors_by_type.keys()))
 
-def plot_kde_results(valid_rollouts, observed):
+def plot_kde_results(valid_rollouts, observed, subplots=False):
     # Finally, draw it
     plt.figure()
     plt.grid(True)
+
+    if subplots:
+        for k in range(4):
+            plt.subplot(5, 1, k+1)
+            plt.title(pattern_index_to_name[k])
+            plt.grid(True)
 
     grid_cells = np.arange(0., 660., 5.)
 
     all_prob_images = []
     regions = []
     for k, rollout in enumerate(valid_rollouts):
+        if subplots:
+            plt.subplot(5, 1, pattern_index_to_name.index(rollout.pattern_name) + 1)
+
         this_prob_image = np.vstack([kde.logpdf(grid_cells) for kde in rollout.kdes])
         region_bin = (this_prob_image > -1e3)
         region_low = grid_cells[np.argmax(region_bin, axis=1)]
@@ -296,51 +360,71 @@ def plot_kde_results(valid_rollouts, observed):
     total_prob_image = sum(all_prob_images) - logsumexp(all_prob_images)
     maxval = np.max(total_prob_image)
     minval = maxval - 1E-3
-    plt.imshow(np.log(-total_prob_image.T),
-               origin='lower', extent=[0, 11, 0, 660], aspect='auto', cmap="YlOrRd", interpolation="bilinear",
-               alpha=1.0)
 
+    if subplots:
+        plt.subplot(5, 1, 5)
     maxes = grid_cells[np.argmax(total_prob_image, axis=1)]
+    plt.imshow(np.log(-total_prob_image.T),
+                   origin='lower', extent=[0, 11, 0, 660], aspect='auto', cmap="YlOrRd", interpolation="bilinear",
+                   alpha=1.0)
     plt.plot(range(12), maxes, color=colors_by_type["Average Prediction"], alpha=0.5)
     print("Maxes: ", maxes)
 
     # Push to after initial imshow so these are on top
     for k, rollout in enumerate(valid_rollouts):
+        if subplots:
+            plt.subplot(5, 1, pattern_index_to_name.index(rollout.pattern_name) + 1)
         plt.fill_between(
             range(12), regions[k][0], regions[k][1],
             alpha=0.25, edgecolor=colors_by_type[rollout.pattern_name],
             facecolor=colormaps_by_type[rollout.pattern_name](float(k)/len(valid_rollouts)))
-        
+
     ks = []
     vals = []
     for k, val in enumerate(observed):
         if val != 0:
             ks.append(k)
             vals.append(val)
-    plt.scatter(ks, vals, color="k")
 
-    label_lines = [Line2D([0], [0], color=colors_by_type[pattern_name], lw=4) for pattern_name in list(colors_by_type.keys())]
-    plt.legend(label_lines, list(colors_by_type.keys()))
+    for k in range(4):
+        if subplots:
+            plt.subplot(5, 1, k+1)
+        plt.scatter(ks, vals, color="k")
+        if not subplots:
+            break
+
+    if not subplots:
+        label_lines = [Line2D([0], [0], color=colors_by_type[pattern_name], lw=4) for pattern_name in list(colors_by_type.keys())]
+        plt.legend(label_lines, list(colors_by_type.keys()))
 
 if __name__ == "__main__":
     model_type = "gmm"
     model_params = {"n_components": 1,
                     "bw_method": 0.05}
+    subplots = False
+    #observed = [109, # base price
+    #        66, 61,  # M
+    #        58, 53,  # T
+    #        48, 114,  # W
+    #        122, 137,  # R
+    #        138, 136,  # F
+    #        0, 0]  # S
+
     observed = [109, # base price
-            66, 61,  # M
-            58, 53,  # T
-            48, 114,  # W
-            122, 137,  # R
-            138, 136,  # F
+            98, 94,  # M
+            91, 86,  # T
+            0, 0,  # W
+            0, 0,  # R
+            0, 0,  # F
             0, 0]  # S
 
-    #observed = [109, # base price
-    #        98, 94,  # M
-    #        0, 0,  # T
-    #        0, 0,  # W
-    #        0, 0,  # R
-    #        0, 0,  # F
-    #        0, 0]  # S
+    #observed = [100,
+    #            0, 0,
+    #            0, 0,
+    #            0, 0,
+    #            0, 0,
+    #            0, 0,
+    #            0, 0]
 
     #observed_data = np.loadtxt("example_data.csv", dtype=int, delimiter=",", skiprows=1, usecols=range(1, 1+13))
     #observed = observed_data[11, :]
@@ -352,7 +436,7 @@ if __name__ == "__main__":
     g = pydrake.common.RandomGenerator()
     
     start = time.time()
-    num_samples = 1000
+    num_samples = 250
 
     # Fit a multivariate normal distribution to each rollout
     for rollout in all_rollouts:
@@ -376,41 +460,41 @@ if __name__ == "__main__":
             valid_rollouts.append(rollout)
 
     if model_type == "gmm":
-        plot_gmm_results(valid_rollouts, observed)
+        plot_gmm_results(valid_rollouts, observed, subplots=subplots)
     elif model_type == "kde":
-        plot_kde_results(valid_rollouts, observed)
+        plot_kde_results(valid_rollouts, observed, subplots=subplots)
 
     #plt.figure()
-   # bins = np.arange(1., 660, 10.)
-   # #plt.figure()
-   # rollout_hists = {}
-   # for rollout_type_k, rollout_type in enumerate(pattern_index_to_name):
-   #     #plt.subplot(4, 1, rollout_type_k+1)
-   #     #plt.grid(True)
-   #     vs = []
-   #     ws = []
-   #     for k, rollout in enumerate(all_rollouts):
-   #         if rollout.pattern_name == rollout_type:
-   #             v = []
-   #             w = []
-   #             for t in range(12):
-   #                 g = pydrake.common.RandomGenerator(k)
-   #                 v.append([rollout.prices[t].Evaluate(g) for i in range(num_samples)])
-   #                 w.append([rollout.rollout_probability]*num_samples)
-   #             vs.append(np.vstack(v))
-   #             ws.append(np.stack(w))
-   #     if len(vs) == 0:
-   #         continue
-   #     vs = np.hstack(vs).T
-   #     ws = np.hstack(ws).T
-   #     # Hist per column
-   #     v_hist = [np.histogram(vs[:, k], bins=bins, density=True, weights=ws[:, k])[0] for k in range(12)]
-   #     v_hist = [v / np.sum(v) for v in v_hist] # Normalize columns
-   #     v_hist = np.vstack(v_hist).T
-   #     rollout_hists[rollout_type] = v_hist
-   #     #plt.imshow(1. - v_hist, origin='lower', extent=[1, 12, 0, 660], aspect='auto')
-   #     #plt.hexbin(np.tile(np.array(range(12)), (vs.shape[0], 1)), vs)
-   #     #plt.title(rollout_type)
+    #bins = np.arange(1., 660, 10.)
+    ##plt.figure()
+    #rollout_hists = {}
+    #for rollout_type_k, rollout_type in enumerate(pattern_index_to_name):
+    #    plt.subplot(4, 1, rollout_type_k+1)
+    #    plt.grid(True)
+    #    vs = []
+    #    ws = []
+    #    for k, rollout in enumerate(all_rollouts):
+    #        if rollout.pattern_name == rollout_type:
+    #            v = []
+    #            w = []
+    #            for t in range(12):
+    #                g = pydrake.common.RandomGenerator(k)
+    #                v.append([rollout.prices[t].Evaluate(g) for i in range(num_samples)])
+    #                w.append([rollout.rollout_probability]*num_samples)
+    #            vs.append(np.vstack(v))
+    #            ws.append(np.stack(w))
+    #    if len(vs) == 0:
+    #        continue
+    #    vs = np.hstack(vs).T
+    #    ws = np.hstack(ws).T
+    #    # Hist per column
+    #    v_hist = [np.histogram(vs[:, k], bins=bins, density=True, weights=ws[:, k])[0] for k in range(12)]
+    #    v_hist = [v / np.sum(v) for v in v_hist] # Normalize columns
+    #    v_hist = np.vstack(v_hist).T
+    #    rollout_hists[rollout_type] = v_hist
+    #    plt.imshow(1. - v_hist, origin='lower', extent=[1, 12, 0, 660], aspect='auto')
+    #    #plt.hexbin(np.tile(np.array(range(12)), (vs.shape[0], 1)), vs)
+    #    #plt.title(rollout_type)
 
 
     # Actually evaluate rollouts and get sequential info
@@ -424,10 +508,11 @@ if __name__ == "__main__":
     #            g = pydrake.common.RandomGenerator(k)
     #            v = [sym.Evaluate(np.array(rollout.prices), generator=g) for i in range(num_samples)]
     #            v = np.hstack(v)
-    #            plt.plot(range(12), v, color=colormaps_by_type[rollout_type](k / len(these_rollouts)), linewidth=1, alpha=0.05)
+    #            plt.plot(range(12), v, color=colormaps_by_type[rollout_type](k / len(these_rollouts)), linewidth=2, alpha=0.05)
     #    plt.title(rollout_type)
 
     # Independent scatters per type
+    #plt.figure()
     #for k in range(12):
     #    # For each rollout...
     #    samples_by_type = {"Large Spike": [], "Decreasing": [], "Small Spike": [], "Random": []}
