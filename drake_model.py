@@ -48,12 +48,79 @@ class Rollout:
         self.means = None
         self.vars = None
         self.model_type = None
+        self.feasible_vals = None
 
     def __repr__(self):
         s = "%s Rollout (weighted %0.3f): " % (self.pattern_name, self.rollout_probability)
         s += "\n\t" + str(self.prices) + "\n"
         return s
 
+    def find_feasible_latents(self, observed):
+        # Build an optimization to estimate the hidden variables
+        try:
+            prog = MathematicalProgram()
+            # Add in all the appropriate variables with their bounds
+            all_vars = self.prices[0].GetVariables()
+            for price in self.prices[1:]:
+                all_vars += price.GetVariables()
+            mp_vars = prog.NewContinuousVariables(len(all_vars))
+            subs_dict = {}
+            for v, mv in zip(all_vars, mp_vars):
+                subs_dict[v] = mv
+            lb = []
+            ub = []
+            #for var in all_vars:
+                #low, high = uniform_variable_to_range[var]
+                #if not isinstance(low, float):
+                #    low = low.Substitute(subs_dict)
+                #if not isinstance(high, float):
+                #    high = high.Substitute(subs_dict)
+                #lb.append(low)
+                #ub.append(high)
+            prog.AddBoundingBoxConstraint(0., 1., mp_vars)
+            #for k in range(len(lb)):
+                #print("C1: ", mp_vars[k] >= lb[k])
+                #print("C2: ", mp_vars[k] <= ub[k])
+                #prog.AddLinearConstraint(mp_vars[k] >= lb[k])
+                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
+                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
+                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
+            # Add the observation constraint
+            for k, val in enumerate(observed[1:]):
+                if val != 0:
+                    print("Val: ", self.prices[k] == val)
+                    prog.AddConstraint(self.prices[k].Substitute(subs_dict) >= val - 2.)
+                    prog.AddConstraint(self.prices[k].Substitute(subs_dict) <= val + 2)
+
+            # Find lower bounds
+            prog.AddCost(np.sum(mp_vars))
+            #print(prog)
+            solver = IpoptSolver()
+            result = solver.Solve(prog)
+            if result.is_success():
+                lb = result.GetSolution(mp_vars)
+                
+                # Find upper bound too
+                prog.AddCost(-2.*np.sum(mp_vars))
+                result = solver.Solve(prog)
+                if result.is_success():
+                    ub = result.GetSolution(mp_vars)
+                    subs_dict = {}
+                    for k, v in enumerate(all_vars):
+                        if lb[k] == ub[k]:
+                            subs_dict[v] = lb[k]
+                        else:
+                            new_var = sym.Variable("feasible_%d" % k, sym.Variable.Type.RANDOM_UNIFORM)
+                            subs_dict[v] = new_var * (ub[k] - lb[k]) + lb[k]
+                    
+                    self.prices = [self.prices[k].Substitute(subs_dict) for k in range(12)]
+                    print("New prices: ", self.prices)
+                    return
+
+        except RuntimeError as e:
+            print("Runtime error: ", e)
+        self.rollout_probability = 0.
+        
     def fit_model(self, num_samples, model_type="gmm", model_params={}):
         g = pydrake.common.RandomGenerator()
         v = [sym.Evaluate(self.prices, generator=g) for i in range(num_samples)]
@@ -429,21 +496,21 @@ if __name__ == "__main__":
     model_params = {"n_components": 1,
                     "bw_method": 0.05}
     subplots = False
-    #observed = [0, # base price, was 109, but first week functional buy price is random
-    #        66, 61,  # M
-    #        58, 53,  # T
-    #        48, 114,  # W
-    #        122, 137,  # R
-    #        138, 136,  # F
-    #        0, 0]  # S
-
-    observed = [109, # base price
-            98, 94,  # M
-            91, 86,  # T
-            82, 78,  # W
-            0, 0,  # R
-            0, 0,  # F
+    observed = [0, # base price, was 109, but first week functional buy price is random
+            66, 61,  # M
+            58, 53,  # T
+            48, 114,  # W
+            122, 137,  # R
+            138, 136,  # F
             0, 0]  # S
+
+    #observed = [109, # base price
+    #        98, 94,  # M
+    #        91, 86,  # T
+    #        82, 78,  # W
+    #        0, 0,  # R
+    #        0, 0,  # F
+    #        0, 0]  # S
 
 
     #observed_data = np.loadtxt("example_data.csv", dtype=int, delimiter=",", skiprows=1, usecols=range(1, 1+13))
@@ -460,6 +527,7 @@ if __name__ == "__main__":
 
     # Fit a model to reach rollout
     for rollout in all_rollouts:
+        rollout.find_feasible_latents(observed)
         rollout.fit_model(
             num_samples,
             model_type=model_type,
@@ -479,57 +547,6 @@ if __name__ == "__main__":
         log_density = rollout.evaluate_logpdf(observed)
         rollout.rollout_probability = np.log(rollout.rollout_probability) + log_density
         print("New log prob for %s: " % rollout.pattern_name, rollout.rollout_probability)
-
-        # Build an optimization to estimate the hidden variables
-        try:
-            prog = MathematicalProgram()
-            # Add in all the appropriate variables with their bounds
-            all_vars = rollout.prices[0].GetVariables()
-            for price in rollout.prices[1:]:
-                all_vars += price.GetVariables()
-            mp_vars = prog.NewContinuousVariables(len(all_vars))
-            subs_dict = {}
-            for v, mv in zip(all_vars, mp_vars):
-                subs_dict[v] = mv
-            lb = []
-            ub = []
-            #for var in all_vars:
-                #low, high = uniform_variable_to_range[var]
-                #if not isinstance(low, float):
-                #    low = low.Substitute(subs_dict)
-                #if not isinstance(high, float):
-                #    high = high.Substitute(subs_dict)
-                #lb.append(low)
-                #ub.append(high)
-            prog.AddBoundingBoxConstraint(0., 1., mp_vars)
-            #for k in range(len(lb)):
-                #print("C1: ", mp_vars[k] >= lb[k])
-                #print("C2: ", mp_vars[k] <= ub[k])
-                #prog.AddLinearConstraint(mp_vars[k] >= lb[k])
-                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
-                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
-                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
-            # Add the observation constraint
-            for k, val in enumerate(observed[1:]):
-                if val != 0:
-                    print("Val: ", rollout.prices[k] == val)
-                    prog.AddConstraint(rollout.prices[k].Substitute(subs_dict) >= val - 10.0)
-                    prog.AddConstraint(rollout.prices[k].Substitute(subs_dict) <= val + 10.0)
-            #print(prog)
-            solver = IpoptSolver()
-            result = solver.Solve(prog)
-            print("Result vals: ", result.GetSolution(mp_vars))
-            print("Result code: ", result.is_success())
-            print("Result details: ", result.get_solver_id().name())
-            #print("Result details: ", result.get_solver_details().ConvertStatusToString())
-            if result.is_success():
-                print("Success!")
-            else:
-                pass
-                rollout.rollout_probability = -np.inf
-        except RuntimeError as e:
-            print("Error ", e)
-            rollout.rollout_probability = -np.inf
         #sys.exit(0)
     
     # Normalize probabilities across remaining rollouts
