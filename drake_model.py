@@ -11,6 +11,8 @@ import time
 import sys
 
 from pydrake.solvers.ipopt import IpoptSolver
+from pydrake.solvers.snopt import SnoptSolver
+from pydrake.solvers.osqp import OsqpSolver
 from pydrake.solvers.mathematicalprogram import MathematicalProgram, Solve
 import pydrake.symbolic as sym
 import pydrake.common
@@ -57,7 +59,7 @@ class Rollout:
 
     def find_feasible_latents(self, observed):
         # Build an optimization to estimate the hidden variables
-        try:
+        try:    
             prog = MathematicalProgram()
             # Add in all the appropriate variables with their bounds
             all_vars = self.prices[0].GetVariables()
@@ -70,32 +72,36 @@ class Rollout:
             lb = []
             ub = []
             prog.AddBoundingBoxConstraint(0., 1., mp_vars)
+            prices_mp = [self.prices[k].Substitute(subs_dict) for k in range(12)]
             # Add the observation constraint
             for k, val in enumerate(observed[1:]):
                 if val != 0:
-                    prog.AddConstraint(self.prices[k].Substitute(subs_dict) >= val - 2.)
-                    prog.AddConstraint(self.prices[k].Substitute(subs_dict) <= val + 2)
+                    prog.AddConstraint(prices_mp[k] >= val - 2.)
+                    prog.AddConstraint(prices_mp[k] <= val + 2)
 
             # Find lower bounds
-            prog.AddCost(np.sum(mp_vars))
-            solver = IpoptSolver()
+            prog.AddCost(sum(prices_mp))
+            solver = SnoptSolver()
             result = solver.Solve(prog)
+
             if result.is_success():
-                lb = result.GetSolution(mp_vars)
-                
+                lb = [result.GetSolution(x).Evaluate() for x in prices_mp]
+                lb_vars = result.GetSolution(mp_vars)
                 # Find upper bound too
-                prog.AddCost(-2.*np.sum(mp_vars))
+                prog.AddCost(-2.*sum(prices_mp))
                 result = solver.Solve(prog)
                 if result.is_success():
-                    ub = result.GetSolution(mp_vars)
+                    ub_vars = result.GetSolution(mp_vars)
+                    ub = [result.GetSolution(x).Evaluate() for x in prices_mp]
+                    self.price_ub = ub
+                    self.price_lb = lb
                     subs_dict = {}
                     for k, v in enumerate(all_vars):
-                        if lb[k] == ub[k]:
-                            subs_dict[v] = lb[k]
+                        if lb_vars[k] == ub_vars[k]:
+                            subs_dict[v] = lb_vars[k]
                         else:
                             new_var = sym.Variable("feasible_%d" % k, sym.Variable.Type.RANDOM_UNIFORM)
-                            subs_dict[v] = new_var * (ub[k] - lb[k]) + lb[k]
-                    
+                            subs_dict[v] = new_var * (ub_vars[k] - lb_vars[k]) + lb_vars[k]
                     self.prices = [self.prices[k].Substitute(subs_dict) for k in range(12)]
                     return
 
@@ -103,10 +109,13 @@ class Rollout:
             print("Runtime error: ", e)
         self.rollout_probability = 0.
         
-    def fit_model(self, num_samples, model_type="gmm", model_params={}):
+    def do_rollouts(self, num_samples):
         g = pydrake.common.RandomGenerator()
         v = [sym.Evaluate(self.prices, generator=g) for i in range(num_samples)]
         self.v = np.stack(v).reshape(num_samples, 12)
+
+    def fit_model(self, num_samples, model_type="gmm", model_params={}):
+        self.do_rollouts(num_samples)
 
         self.model_type = model_type
         if model_type == "gmm":
@@ -204,15 +213,12 @@ def generate_random_pattern_rollouts(base_price, rollout_probability):
     # Inc_3 is [0, Inc_2and3] long
     # Inc_2 is Inc_2and3 - Inc_3 long
     out = []
-    reduced_prob = 1.
     for inc_1_length in range(7):
-        reduced_prob /= 7.
         inc_2and3_length = 7 - inc_1_length
         for inc_3_length in range(0, inc_2and3_length):
-            reduced_prob /= inc_2and3_length
             inc_2_length = inc_2and3_length - inc_3_length
             for dec_1_length in [2, 3]:
-                reduced_prob /= 2
+                reduced_prob = 1. / 7. / inc_2and3_length / 2.
                 dec_2_length = 5 - dec_1_length
 
                 # Actual generation of this rollout
@@ -333,25 +339,7 @@ def generate_all_turnip_patterns(previous_pattern_prior, base_price=None):
 
     return all_rollouts
 
-def plot_gmm_results(valid_rollouts, observed, subplots=False):
-    # Combine the valid rollouts into a final model over prices
-    # by combining the modes
-    all_means = []
-    all_covars = []
-    all_weights = []
-    for rollout in valid_rollouts:
-        all_means.append(rollout.g.means_)
-        all_covars.append(rollout.g.covariances_)
-        all_weights.append(rollout.g.weights_)
-    all_means = np.vstack(all_means)
-    all_covars = np.vstack(all_covars)
-    all_weights = np.concatenate(all_weights)
-    all_weights /= np.sum(all_weights)
-    for k, val in enumerate(observed[1:]):
-        if val != 0:
-            all_means[:, k] = val
-            all_covars[:, k] = 0.
-
+def plot_results(valid_rollouts, observed, num_samples=0, subplots=False):
     # Finally, draw it
     plt.grid(True)
 
@@ -364,28 +352,13 @@ def plot_gmm_results(valid_rollouts, observed, subplots=False):
     for k, rollout in enumerate(valid_rollouts):
         if subplots:
             plt.subplot(5, 1, pattern_index_to_name.index(rollout.pattern_name) + 1)
-
-        for comp_k in range(len(rollout.g.weights_)):
-            mean = rollout.g.means_[comp_k, :]
-            covar = rollout.g.covariances_[comp_k, :]
-            plt.plot(range(12), mean,
-                     color=colors_by_type[rollout.pattern_name],
-                     alpha=0.5, linestyle="--")
-            plt.fill_between(
-                range(12), mean-1.96*np.sqrt(covar), mean+1.96*np.sqrt(covar),
-                alpha=0.5, edgecolor=colors_by_type[rollout.pattern_name],
-                facecolor=colormaps_by_type[rollout.pattern_name](float(k)/len(valid_rollouts)))
-
-    for comp_k in range(len(all_weights)):
-        mean = all_means[comp_k, :]
-        covar = all_covars[comp_k, :]
-        weight = all_weights[comp_k]
-
-
-    # Mean of means
-    if subplots:
-        plt.subplot(5, 1, 5)
-    plt.plot(range(12), np.sum(all_weights.T*all_means.T, axis=1), color=colors_by_type["Average Prediction"], alpha=0.5)
+        if num_samples > 0:
+            rollout.do_rollouts(num_samples=num_samples)
+            plt.plot(range(12), rollout.v.T, color=colormaps_by_type[rollout.pattern_name](k / len(valid_rollouts)), linewidth=2, alpha=0.05)
+        plt.fill_between(
+            range(12), rollout.price_lb, rollout.price_ub,
+            alpha=0.5, edgecolor=colors_by_type[rollout.pattern_name],
+            facecolor=colormaps_by_type[rollout.pattern_name](float(k)/len(valid_rollouts)))
 
     ks = []
     vals = []
@@ -404,96 +377,33 @@ def plot_gmm_results(valid_rollouts, observed, subplots=False):
         label_lines = [Line2D([0], [0], color=colors_by_type[pattern_name], lw=4) for pattern_name in list(colors_by_type.keys())]
         plt.legend(label_lines, list(colors_by_type.keys()))
 
-def plot_kde_results(valid_rollouts, observed, subplots=False):
-    # Finally, draw it
-    plt.grid(True)
-
-    if subplots:
-        for k in range(4):
-            plt.subplot(5, 1, k+1)
-            plt.title(pattern_index_to_name[k])
-            plt.grid(True)
-
-    grid_cells = np.arange(0., 660., 5.)
-
-    all_prob_images = []
-    regions = []
-    for k, rollout in enumerate(valid_rollouts):
-        if subplots:
-            plt.subplot(5, 1, pattern_index_to_name.index(rollout.pattern_name) + 1)
-
-        this_prob_image = np.vstack([kde.logpdf(grid_cells) for kde in rollout.kdes])
-        region_bin = (this_prob_image > -1e3)
-        region_low = grid_cells[np.argmax(region_bin, axis=1)]
-        region_high = grid_cells[-1 - np.argmax(np.flip(region_bin, axis=1), axis=1)]
-        regions.append((region_low, region_high))
-        all_prob_images.append(this_prob_image + rollout.rollout_probability)
-
-    total_prob_image = sum(all_prob_images) - logsumexp(all_prob_images)
-    maxval = np.max(total_prob_image)
-    minval = maxval - 1E-3
-
-    if subplots:
-        plt.subplot(5, 1, 5)
-    maxes = grid_cells[np.argmax(total_prob_image, axis=1)]
-    plt.imshow(np.log(-total_prob_image.T),
-                   origin='lower', extent=[0, 11, 0, 660], aspect='auto', cmap="YlOrRd", interpolation="bilinear",
-                   alpha=1.0)
-    plt.plot(range(12), maxes, color=colors_by_type["Average Prediction"], alpha=0.5)
-
-    # Push to after initial imshow so these are on top
-    for k, rollout in enumerate(valid_rollouts):
-        if subplots:
-            plt.subplot(5, 1, pattern_index_to_name.index(rollout.pattern_name) + 1)
-        plt.fill_between(
-            range(12), regions[k][0], regions[k][1],
-            alpha=0.25, edgecolor=colors_by_type[rollout.pattern_name],
-            facecolor=colormaps_by_type[rollout.pattern_name](float(k)/len(valid_rollouts)))
-
-    ks = []
-    vals = []
-    for k, val in enumerate(observed[1:]):
-        if val != 0:
-            ks.append(k)
-            vals.append(val)
-
-    for k in range(4):
-        if subplots:
-            plt.subplot(5, 1, k+1)
-        plt.scatter(ks, vals, color="k")
-        if not subplots:
-            break
-
-    if not subplots:
-        label_lines = [Line2D([0], [0], color=colors_by_type[pattern_name], lw=4) for pattern_name in list(colors_by_type.keys())]
-        plt.legend(label_lines, list(colors_by_type.keys()))
-
-def do_analysis(observed,
-                model_type="gmm", model_params={"n_components": 1},
-                num_samples=250):
+def do_analysis(observed):
     previous_pattern_prior = generate_previous_pattern_steady_state()
     all_rollouts = generate_all_turnip_patterns(previous_pattern_prior, observed[0])
 
     # Fit a model to reach rollout
     for rollout in all_rollouts:
         rollout.find_feasible_latents(observed)
-        rollout.fit_model(
-            num_samples,
-            model_type=model_type,
-            model_params=model_params)
-
-    # Adjust the probability of each rollout based on the normal dist
-    for rollout in all_rollouts:
-        log_density = rollout.evaluate_logpdf(observed)
-        rollout.rollout_probability = np.log(rollout.rollout_probability) + log_density
+        #rollout.fit_model(
+        #    num_samples,
+        #    model_type=model_type,
+        #    model_params=model_params)
 
     # Normalize probabilities across remaining rollouts
-    total_log_prob = logsumexp([rollout.rollout_probability for rollout in all_rollouts])
+    # These numbers are tame enough that we don't realy need log prob messiness
+    total_prob = np.sum([rollout.rollout_probability for rollout in all_rollouts])
     valid_rollouts = []
+    total_prob_of_types = {}
     for rollout in all_rollouts:
-        rollout.rollout_probability -= total_log_prob
-        if rollout.rollout_probability > np.log(1e-4):
+        rollout.rollout_probability /= total_prob
+        print("Prob of type %s: " % rollout.pattern_name, rollout.rollout_probability)
+        if rollout.pattern_name not in total_prob_of_types.keys():
+            total_prob_of_types[rollout.pattern_name] = rollout.rollout_probability
+        else:
+            total_prob_of_types[rollout.pattern_name] += rollout.rollout_probability
+        if rollout.rollout_probability > 0.001:
             valid_rollouts.append(rollout)
+    print("Total prob of types: ", total_prob_of_types)
     return valid_rollouts
 
 
@@ -507,10 +417,7 @@ if __name__ == "__main__":
             138, 136,  # F
             0, 0]  # S
     subplots = False
-    model_type="gmm"
-    model_params = {"n_components": 1,
-                    "bw_method": 0.05}
-    num_samples = 250
+    num_samples = 100
     #observed = [109, # base price
     #        98, 94,  # M
     #        91, 86,  # T
@@ -521,23 +428,17 @@ if __name__ == "__main__":
 
 
     #observed_data = np.loadtxt("example_data.csv", dtype=int, delimiter=",", skiprows=1, usecols=range(1, 1+13))
-    #observed = observed_data[8, :]
+    #observed = observed_data[39, :]
     print("Observed: ", observed)
     plt.figure(dpi=300).set_size_inches(12, 12)
-    for k in range(12):
+    for k in range(13):
         sub_observed = [0] * 13
+        sub_observed[0] = observed[0]
         sub_observed[1:(1+k)] = observed[1:(1+k)]
         print(sub_observed)
-        valid_rollouts = do_analysis(
-            sub_observed,
-            model_type=model_type,
-            model_params=model_params,
-            num_samples=num_samples)
+        valid_rollouts = do_analysis(sub_observed)
         plt.gca().clear()
-        if model_type == "gmm":
-            plot_gmm_results(valid_rollouts, sub_observed, subplots=subplots)
-        elif model_type == "kde":
-            plot_kde_results(valid_rollouts, sub_observed, subplots=subplots)
+        plot_results(valid_rollouts, sub_observed, num_samples=num_samples, subplots=subplots)
         plt.ylim([0, 660])
         plt.title("With %d observations" % sum([x != 0 for x in sub_observed[1:]]))
         plt.savefig("%d.jpg" % k)
