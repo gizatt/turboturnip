@@ -8,12 +8,36 @@ from scipy.special import logsumexp
 from sklearn import mixture
 
 import time
+import sys
 
+from pydrake.solvers.ipopt import IpoptSolver
+from pydrake.solvers.mathematicalprogram import MathematicalProgram, Solve
 import pydrake.symbolic as sym
 import pydrake.common
+from pydrake.common.containers import EqualToDict
 
 '''
 Analyzes Animal Crossing: New Horizons turnip pricing with sympy.
+
+
+Optimization notes:
+
+Every rollout type, with one exception, has each price linear
+in the uniformly distributed variables. The exception is the
+small spike, in which the immediately pre and post-spike values
+have a bilinear term 
+
+    small_spike_rate_spike_ub * small_spike_rate_pre_spike = C_N-1
+    small_spike_rate_spike_ub * small_spike_rate_post_spike = C_N+1
+
+When the true peak is observed, small_spike_rate_spike_ub is
+directly observable as
+
+    small_spike_rate_spike_ub  * base_price = C_N
+
+but I can't guarantee both the off-peak /and/ peak terms will
+be observed...
+
 '''
 
 class Rollout:
@@ -83,12 +107,14 @@ class Rollout:
             return total_log_density
 
 uniform_variable_store = {}
+uniform_variable_to_range = EqualToDict()
 def random_uniform(name, low, high):
     if name not in uniform_variable_store.keys():
         var = sym.Variable(name, sym.Variable.Type.RANDOM_UNIFORM)
-        uniform_variable_store[name] = (var, low, high)
+        uniform_variable_store[name] = var
+        uniform_variable_to_range[var] = (low, high)
     else:
-        var, lows, highs = uniform_variable_store[name]
+        var = uniform_variable_store[name]
     return var*(high-low)+low
 
 pattern_index_to_name = [
@@ -107,7 +133,7 @@ colors_by_type = {"Large Spike": np.array([0., 0., 1]), "Decreasing": np.array([
                  "Small Spike": np.array([0., 1., 0.]), "Random": np.array([1., 0., 1.]),
                  "Average Prediction": np.array([0.1, 0.1, 0.1])}
 colormaps_by_type = {"Large Spike": cm.get_cmap('winter'),
-                     "Decreasing": cm.get_cmap('spring'),
+                     "Decreasing": cm.get_cmap('autumn'),
                      "Small Spike": cm.get_cmap('summer'),
                      "Random": cm.get_cmap('cool')}
 
@@ -217,6 +243,7 @@ def generate_small_spike_pattern_rollouts(base_price, rollout_probability):
         prices.append(random_uniform("small_spike_rate_1", 0.9, 1.4) * base_price)
         prices.append(random_uniform("small_spike_rate_2", 0.9, 1.4) * base_price)
         peak_rate = random_uniform("small_spike_rate_spike_ub", 1.4, 2.0)
+
         prices.append(random_uniform("small_spike_rate_pre_spike", 1.4, peak_rate) * base_price - 1)
         prices.append(peak_rate * base_price)
         prices.append(random_uniform("small_spike_rate_post_spike", 1.4, peak_rate) * base_price - 1)
@@ -316,7 +343,7 @@ def plot_gmm_results(valid_rollouts, observed, subplots=False):
 
     ks = []
     vals = []
-    for k, val in enumerate(observed):
+    for k, val in enumerate(observed[1:]):
         if val != 0:
             ks.append(k)
             vals.append(val)  
@@ -381,7 +408,7 @@ def plot_kde_results(valid_rollouts, observed, subplots=False):
 
     ks = []
     vals = []
-    for k, val in enumerate(observed):
+    for k, val in enumerate(observed[1:]):
         if val != 0:
             ks.append(k)
             vals.append(val)
@@ -402,7 +429,7 @@ if __name__ == "__main__":
     model_params = {"n_components": 1,
                     "bw_method": 0.05}
     subplots = False
-    #observed = [109, # base price
+    #observed = [0, # base price, was 109, but first week functional buy price is random
     #        66, 61,  # M
     #        58, 53,  # T
     #        48, 114,  # W
@@ -413,21 +440,14 @@ if __name__ == "__main__":
     observed = [109, # base price
             98, 94,  # M
             91, 86,  # T
-            0, 0,  # W
+            82, 78,  # W
             0, 0,  # R
             0, 0,  # F
             0, 0]  # S
 
-    #observed = [100,
-    #            0, 0,
-    #            0, 0,
-    #            0, 0,
-    #            0, 0,
-    #            0, 0,
-    #            0, 0]
 
     #observed_data = np.loadtxt("example_data.csv", dtype=int, delimiter=",", skiprows=1, usecols=range(1, 1+13))
-    #observed = observed_data[11, :]
+    #observed = observed_data[8, :]
 
     print("Observed: ", observed)
     previous_pattern_prior = generate_previous_pattern_steady_state()
@@ -438,18 +458,79 @@ if __name__ == "__main__":
     start = time.time()
     num_samples = 250
 
-    # Fit a multivariate normal distribution to each rollout
+    # Fit a model to reach rollout
     for rollout in all_rollouts:
         rollout.fit_model(
             num_samples,
             model_type=model_type,
             model_params=model_params)
+
+        # Report the optimization degrees
+        #for k, price in enumerate(rollout.prices):
+        #    if price.is_polynomial():
+        #        deg = sym.Polynomial(price).TotalDegree()
+        #        if deg > 1:
+        #            print("Price %d in %s of degree %d: " % (k, rollout.pattern_name, deg), price)
+        #    else:
+        #        print("Price %d in %s is not polynomial: " % (k, rollout.pattern_name), price)
         
     # Adjust the probability of each rollout based on the normal dist
     for rollout in all_rollouts:
         log_density = rollout.evaluate_logpdf(observed)
         rollout.rollout_probability = np.log(rollout.rollout_probability) + log_density
-        print("New log prob: ", rollout.rollout_probability)
+        print("New log prob for %s: " % rollout.pattern_name, rollout.rollout_probability)
+
+        # Build an optimization to estimate the hidden variables
+        try:
+            prog = MathematicalProgram()
+            # Add in all the appropriate variables with their bounds
+            all_vars = rollout.prices[0].GetVariables()
+            for price in rollout.prices[1:]:
+                all_vars += price.GetVariables()
+            mp_vars = prog.NewContinuousVariables(len(all_vars))
+            subs_dict = {}
+            for v, mv in zip(all_vars, mp_vars):
+                subs_dict[v] = mv
+            lb = []
+            ub = []
+            #for var in all_vars:
+                #low, high = uniform_variable_to_range[var]
+                #if not isinstance(low, float):
+                #    low = low.Substitute(subs_dict)
+                #if not isinstance(high, float):
+                #    high = high.Substitute(subs_dict)
+                #lb.append(low)
+                #ub.append(high)
+            prog.AddBoundingBoxConstraint(0., 1., mp_vars)
+            #for k in range(len(lb)):
+                #print("C1: ", mp_vars[k] >= lb[k])
+                #print("C2: ", mp_vars[k] <= ub[k])
+                #prog.AddLinearConstraint(mp_vars[k] >= lb[k])
+                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
+                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
+                #prog.AddLinearConstraint(mp_vars[k] <= ub[k])
+            # Add the observation constraint
+            for k, val in enumerate(observed[1:]):
+                if val != 0:
+                    print("Val: ", rollout.prices[k] == val)
+                    prog.AddConstraint(rollout.prices[k].Substitute(subs_dict) >= val - 10.0)
+                    prog.AddConstraint(rollout.prices[k].Substitute(subs_dict) <= val + 10.0)
+            #print(prog)
+            solver = IpoptSolver()
+            result = solver.Solve(prog)
+            print("Result vals: ", result.GetSolution(mp_vars))
+            print("Result code: ", result.is_success())
+            print("Result details: ", result.get_solver_id().name())
+            #print("Result details: ", result.get_solver_details().ConvertStatusToString())
+            if result.is_success():
+                print("Success!")
+            else:
+                pass
+                rollout.rollout_probability = -np.inf
+        except RuntimeError as e:
+            print("Error ", e)
+            rollout.rollout_probability = -np.inf
+        #sys.exit(0)
     
     # Normalize probabilities across remaining rollouts
     total_log_prob = logsumexp([rollout.rollout_probability for rollout in all_rollouts])
